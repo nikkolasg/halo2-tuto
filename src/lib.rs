@@ -1,4 +1,5 @@
 extern crate halo2;
+
 use halo2::{
     arithmetic::FieldExt,
     circuit::{Cell, Chip, Layouter, SimpleFloorPlanner},
@@ -243,7 +244,7 @@ impl<F: FieldExt> NumericInstructions<F> for FieldChip<F> {
                     || "rhs",
                     config.advices[1],
                     0,
-                    || a.value.ok_or(Error::SynthesisError),
+                    || b.value.ok_or(Error::SynthesisError),
                 )?;
                 region.constrain_equal(a.cell, lhs)?;
                 region.constrain_equal(b.cell, rhs)?;
@@ -286,7 +287,7 @@ impl<F: FieldExt> NumericInstructions<F> for FieldChip<F> {
                     || "rhs",
                     config.advices[1],
                     0,
-                    || a.value.ok_or(Error::SynthesisError),
+                    || b.value.ok_or(Error::SynthesisError),
                 )?;
                 region.constrain_equal(a.cell, lhs)?;
                 region.constrain_equal(b.cell, rhs)?;
@@ -314,7 +315,6 @@ struct MyCircuit<F: FieldExt> {
     constant: F,
     a: Option<F>,
     b: Option<F>,
-    fail: bool,
 }
 
 impl<F: FieldExt> Circuit<F> for MyCircuit<F> {
@@ -343,42 +343,39 @@ impl<F: FieldExt> Circuit<F> for MyCircuit<F> {
         let constant =
             field_chip.load_constant(layouter.namespace(|| "load const"), self.constant)?;
 
-        // This works fine when using the same variable
-        let bb = field_chip.add(layouter.namespace(|| "2b"), b.clone(), b.clone())?;
-        let aa = field_chip.add(layouter.namespace(|| "2a"), a.clone(), a.clone())?;
-        // This one not when using two different cells
-        if self.fail {
-            let ab = field_chip.add(layouter.namespace(|| "a+b"), a.clone(), b.clone())?;
-        }
-
         // a^2 + b^2 + constant = c^2
-        //let bsquare = field_chip.mul(layouter.namespace(|| "b^2"), b.clone(), b.clone())?;
-        //let asquare = field_chip.mul(layouter.namespace(|| "a^2"), a.clone(), a.clone())?;
+        let bsquare = field_chip.mul(layouter.namespace(|| "b^2"), b.clone(), b.clone())?;
+        let asquare = field_chip.mul(layouter.namespace(|| "a^2"), a.clone(), a.clone())?;
 
-        //let ab2 = field_chip.add(layouter.namespace(|| "a^2+b^2"), asquare, bsquare)?;
-        //let ab2const = field_chip.add(layouter.namespace(|| "a2 + b2 + const"), ab2, constant)?;
-        //let c2 = field_chip.add(layouter.namespace(|| "c^2"), c.clone(), c)?;
+        let ab2 = field_chip.add(layouter.namespace(|| "a^2+b^2"), asquare, bsquare)?;
+        let ab2const = field_chip.add(
+            layouter.namespace(|| "a2 + b2 + const"),
+            ab2.clone(),
+            constant,
+        )?;
+        let c2 = field_chip.mul(layouter.namespace(|| "c^2"), c.clone(), c.clone())?;
         //// TODO can we do it better ? would be nice to have
         //// layouter.constrain_equal instead of spawning a region just for this?
-        //layouter.namespace(|| "check equal").assign_region(
-        //|| "check",
-        //|mut region| {
-        //let lhs = region.assign_advice(
-        //|| "lhs",
-        //field_chip.config().advices[0],
-        //0,
-        //|| ab2const.value.ok_or(Error::SynthesisError),
-        //)?;
-        //let rhs = region.assign_advice(
-        //|| "rhs",
-        //field_chip.config().advices[1],
-        //0,
-        //|| c2.value.ok_or(Error::SynthesisError),
-        //)?;
-
-        //region.constrain_equal(lhs, rhs)
-        //},
-        /*)?;*/
+        layouter.namespace(|| "check equal").assign_region(
+            || "check",
+            |mut region| {
+                let lhs = region.assign_advice(
+                    || "lhs",
+                    field_chip.config().advices[0],
+                    0,
+                    || ab2const.value.ok_or(Error::SynthesisError),
+                )?;
+                let rhs = region.assign_advice(
+                    || "rhs",
+                    field_chip.config().advices[1],
+                    0,
+                    || c2.value.ok_or(Error::SynthesisError),
+                )?;
+                region.constrain_equal(ab2const.cell, lhs)?;
+                region.constrain_equal(c2.cell, rhs)?;
+                region.constrain_equal(lhs, rhs)
+            },
+        )?;
         Ok(())
     }
 }
@@ -403,11 +400,10 @@ mod tests {
             constant,
             a: Some(a),
             b: Some(b),
-            fail: true,
         };
         let gates = CircuitGates::collect::<Fp, MyCircuit<Fp>>();
         println!("{}", gates);
-        let mut public_inputs = vec![input];
+        let public_inputs = vec![input];
         let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
     }
