@@ -2,6 +2,7 @@ extern crate halo2;
 use halo2::{
     arithmetic::FieldExt,
     circuit::{Cell, Chip, Layouter, SimpleFloorPlanner},
+    dev::CircuitGates,
     plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance, Selector},
     poly::Rotation,
 };
@@ -75,11 +76,7 @@ struct FieldConfig {
     advices: [Column<Advice>; 2],
     // public inputs columns
     instance: Column<Instance>,
-    // We need a selector to enable the multiplication gate, so that we aren't placing
-    // any constraints on cells where `NumericInstructions::mul` is not being used.
-    // This is important when building larger circuits, where columns are used by
-    // multiple sets of instructions.
-    selector: Selector,
+    smul: Selector,
     sadd: Selector,
     constant: Column<Fixed>,
 }
@@ -104,13 +101,13 @@ impl<F: FieldExt> FieldChip<F> {
         for column in &advices {
             meta.enable_equality((*column).into());
         }
-        let s_mul = meta.selector();
+        let smul = meta.selector();
         let sadd = meta.selector();
         meta.create_gate("mul", |meta| {
             let lhs = meta.query_advice(advices[0], Rotation::cur());
             let rhs = meta.query_advice(advices[1], Rotation::cur());
             let out = meta.query_advice(advices[0], Rotation::next());
-            let sel = meta.query_selector(s_mul);
+            let sel = meta.query_selector(smul);
             vec![sel * (lhs * rhs - out)]
         });
 
@@ -126,7 +123,7 @@ impl<F: FieldExt> FieldChip<F> {
             advices: advices,
             instance: instance,
             constant: constant,
-            selector: s_mul,
+            smul: smul,
             sadd: sadd,
         }
     }
@@ -278,11 +275,7 @@ impl<F: FieldExt> NumericInstructions<F> for FieldChip<F> {
         layouter.assign_region(
             || "mul",
             |mut region| {
-                config.selector.enable(&mut region, 0)?;
-                // The inputs we've been given could be located anywhere in the circuit,
-                // but we can only rely on relative offsets inside this region. So we
-                // assign new cells inside the region and constrain them to have the
-                // same values as the inputs.
+                config.smul.enable(&mut region, 0)?;
                 let lhs = region.assign_advice(
                     || "lhs",
                     config.advices[0],
@@ -321,6 +314,7 @@ struct MyCircuit<F: FieldExt> {
     constant: F,
     a: Option<F>,
     b: Option<F>,
+    fail: bool,
 }
 
 impl<F: FieldExt> Circuit<F> for MyCircuit<F> {
@@ -332,11 +326,8 @@ impl<F: FieldExt> Circuit<F> for MyCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        // We create the two advice columns that FieldChip uses for I/O.
         let advice = [meta.advice_column(), meta.advice_column()];
-        // We also need an instance column to store public inputs.
         let instance = meta.instance_column();
-        // Create a fixed column to load constants.
         let constant = meta.fixed_column();
         FieldChip::configure(meta, advice, instance, constant)
     }
@@ -348,18 +339,27 @@ impl<F: FieldExt> Circuit<F> for MyCircuit<F> {
         let field_chip = FieldChip::<F>::construct(config);
         let a = field_chip.load_private(layouter.namespace(|| "load a"), self.a)?;
         let b = field_chip.load_private(layouter.namespace(|| "load b"), self.b)?;
-        // we put it at the first row
         let c = field_chip.load_public(layouter.namespace(|| "load pub c"), 0)?;
         let constant =
             field_chip.load_constant(layouter.namespace(|| "load const"), self.constant)?;
+
+        // This works fine when using the same variable
+        let bb = field_chip.add(layouter.namespace(|| "2b"), b.clone(), b.clone())?;
+        let aa = field_chip.add(layouter.namespace(|| "2a"), a.clone(), a.clone())?;
+        // This one not when using two different cells
+        if self.fail {
+            let ab = field_chip.add(layouter.namespace(|| "a+b"), a.clone(), b.clone())?;
+        }
+
         // a^2 + b^2 + constant = c^2
-        let asquare = field_chip.mul(layouter.namespace(|| "a^2"), a.clone(), a)?;
-        let bsquare = field_chip.mul(layouter.namespace(|| "b^2"), b.clone(), b)?;
-        let ab2 = field_chip.add(layouter.namespace(|| "a^2+b^2"), asquare, bsquare)?;
+        //let bsquare = field_chip.mul(layouter.namespace(|| "b^2"), b.clone(), b.clone())?;
+        //let asquare = field_chip.mul(layouter.namespace(|| "a^2"), a.clone(), a.clone())?;
+
+        //let ab2 = field_chip.add(layouter.namespace(|| "a^2+b^2"), asquare, bsquare)?;
         //let ab2const = field_chip.add(layouter.namespace(|| "a2 + b2 + const"), ab2, constant)?;
         //let c2 = field_chip.add(layouter.namespace(|| "c^2"), c.clone(), c)?;
         //// TODO can we do it better ? would be nice to have
-        //// layouter.constrain_equal?
+        //// layouter.constrain_equal instead of spawning a region just for this?
         //layouter.namespace(|| "check equal").assign_region(
         //|| "check",
         //|mut region| {
@@ -392,6 +392,7 @@ mod tests {
     fn pythagorean() {
         let k = 10;
 
+        // a^2 + b^2 + k = c^2 ->
         // 2^2 + 3^2 + 3 = 4^2
         let constant = Fp::from(3);
         let a = Fp::from(2);
@@ -402,7 +403,10 @@ mod tests {
             constant,
             a: Some(a),
             b: Some(b),
+            fail: true,
         };
+        let gates = CircuitGates::collect::<Fp, MyCircuit<Fp>>();
+        println!("{}", gates);
         let mut public_inputs = vec![input];
         let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
