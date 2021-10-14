@@ -1,3 +1,10 @@
+// This module implements a circuit that checks for a witness a,b,q and public
+// input c and d:
+// * a^2 + b^2 + q = c^2
+// * a ^ b = d
+// The columns will look like this:
+// advice[0] advice[1] fixed xoreds_mul s_add instance
+// The public inputs are passed in order [c,d]
 extern crate halo2;
 
 use halo2::{
@@ -47,22 +54,6 @@ trait NumericInstructions<F: FieldExt>: Chip<F> {
     ) -> Result<Self::Num, Error>;
 }
 
-// Do the circuit: a^2 + b^2 + q = c^2 with c public input (instance) and a and b and q
-// are the witness
-// Any constant is loaded into the first advice column
-// The total matrix will look stg like:
-// advice[0] advice[1] fixed s_mul s_add instance
-//                                        c
-// a
-// b
-//                      q
-// a          a              1                  <---- mul gate
-// a^2
-// b          b              1                   <---- mul gate
-// b^2
-// a^2        b^2      q            1            <---- add gate
-// c        c
-// c^2                       1                   <---- mul gate
 struct FieldChip<F: FieldExt> {
     config: FieldConfig,
     _marker: PhantomData<F>,
@@ -298,7 +289,6 @@ impl<F: FieldExt> NumericInstructions<F> for FieldChip<F> {
         let config = self.config();
         // Constrains a [`Cell`] to equal an instance column's row value at an
         // absolute position.
-        // This
         layouter.constrain_instance(num.cell, config.instance, row)
     }
 
@@ -448,7 +438,7 @@ mod tests {
         assert_eq!(exp, got);
     }
     #[test]
-    fn pythagorean() {
+    fn circuit() {
         // storing the private variables here
         #[derive(Default)]
         struct Pythagore<F: FieldExt> {
@@ -491,6 +481,7 @@ mod tests {
                 let constant =
                     field_chip.load_constant(layouter.namespace(|| "load const"), self.constant)?;
 
+                // First test
                 // a^2 + b^2 + constant = c^2
                 let bsquare = field_chip.mul(layouter.namespace(|| "b^2"), b.clone(), b.clone())?;
                 let asquare = field_chip.mul(layouter.namespace(|| "a^2"), a.clone(), a.clone())?;
@@ -525,7 +516,11 @@ mod tests {
                     },
                 )?;
 
-                let _ = field_chip.xor(layouter.namespace(|| "a xor b"), a.clone(), b.clone())?;
+                // Second test
+                let xord =
+                    field_chip.xor(layouter.namespace(|| "a xor b"), a.clone(), b.clone())?;
+                // we expose the xor as second public input
+                field_chip.expose_public(layouter.namespace(|| "expose xor"), xord, 1)?;
                 Ok(())
             }
         }
@@ -536,7 +531,9 @@ mod tests {
         let constant = Fp::from(3);
         let a = Fp::from(2);
         let b = Fp::from(3);
-        let input = Fp::from(4);
+        let c = Fp::from(4);
+        // a ^ b = xord
+        let xord = Fp::from((a.get_lower_32() ^ b.get_lower_32()) as u64);
 
         let circuit = Pythagore {
             constant,
@@ -545,12 +542,12 @@ mod tests {
         };
         let gates = CircuitGates::collect::<Fp, Pythagore<Fp>>();
         println!("{}", gates);
-        let public_inputs = vec![input];
+        let public_inputs = vec![c, xord];
         let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
 
         // bad inputs
-        let public_inputs = vec![input + Fp::from(1)];
+        let public_inputs = vec![c + Fp::from(1), xord];
         let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
     }
